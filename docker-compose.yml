@@ -1,0 +1,21 @@
+services:
+  # Уникальное имя сервиса: на общем хосте generic-алиасы уже путали чужой трафик.
+  # Long polling, портов наружу нет, к чужим сетям не подключаемся.
+  tg-secretary:
+    build: .
+    image: tg-secretary:latest
+    container_name: tg-secretary
+    restart: unless-stopped
+    mem_limit: 384m
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+      TZ: Asia/Tashkent
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
