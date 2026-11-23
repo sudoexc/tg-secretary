@@ -223,6 +223,8 @@ async def on_message(app: App, msg: Message) -> Incoming | None:
                 from_bot=from_bot)
     if is_ephemeral(msg):
         log.info("сообщение %s/%s защищено или одноразовое: не храним", chat_id, msg.message_id)
+        if not (is_owner or bot_sent):
+            await _notify_ephemeral(app, msg, chat_id)
         return Incoming(stored=None, ephemeral=True, **base)
     ex = extract(msg)
     stored = _stored(conn, msg, ex, is_owner or bot_sent, bot_sent)
@@ -232,6 +234,19 @@ async def on_message(app: App, msg: Message) -> Incoming | None:
     if not stored.is_owner or await app.get_bool("spy_mine"):
         await download(app, stored)
     return Incoming(stored=stored, ephemeral=False, **base)
+
+
+EPHEMERAL_LABEL = (("photo", "фото"), ("video", "видео"), ("video_note", "кружок"), ("voice", "голосовое"),
+                   ("animation", "гиф"), ("document", "файл"), ("audio", "аудио"))
+
+
+async def _notify_ephemeral(app: App, msg: Message, chat_id: int) -> None:
+    """Только факт и тип: само содержимое одноразового или защищённого сообщения не берём."""
+    label = next((name for attr, name in EPHEMERAL_LABEL if getattr(msg, attr, None)), "сообщение")
+    how = "с защитой от сохранения" if msg.has_protected_content else "на один просмотр"
+    who = fmt.link(await app.repo.get_chat(chat_id), chat_id)
+    at = fmt.when(_date(msg), app.s.tz, app.now())
+    await app.notify(f"📸 {who} прислал(а) {label} {how} · {at}\nСодержимое не сохраняется.")
 
 
 def _safe(part: str) -> str:

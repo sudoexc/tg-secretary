@@ -201,6 +201,19 @@ async def test_view_once_and_protected_not_stored(ready: World) -> None:
     assert await w.app.repo.waiting_pending(CLIENT) is None
 
 
+async def test_view_once_notifies_owner_without_content(ready: World) -> None:
+    w = ready
+    w.session.clear()
+    await w.client_says("секрет", kind="photo", file_id="once9", media_extra={"ttl_seconds": 10})
+    texts = w.session.owner_texts()
+    assert any("прислал(а) фото на один просмотр" in t and "Содержимое не сохраняется" in t for t in texts)
+    assert not any("секрет" in t for t in texts)
+    assert w.session.to_owner("sendPhoto", "sendVideo") == []
+    w.session.clear()
+    await w.client_says(None, kind="video", file_id="prot9", protected=True)
+    assert any("видео с защитой от сохранения" in t for t in w.session.owner_texts())
+
+
 async def test_edit_to_protected_drops_stored_copy(ready: World) -> None:
     w = ready
     mid = await w.client_says(None, kind="photo", file_id="pp", caption="x")
