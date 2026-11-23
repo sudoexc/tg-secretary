@@ -393,3 +393,21 @@ async def test_full_flow_through_polling(live: Live, caplog: pytest.LogCaptureFi
     log_text = "\n".join(r.getMessage() for r in caplog.records)
     for secret in (FIRST, EDITED, FOREIGN_TEXT, "лендинг", "битого апдейта", reply.text):
         assert secret not in log_text
+
+
+@pytest.mark.parametrize("live", [str(OWNER_ID)], indirect=True)
+async def test_same_batch_keeps_order_within_chat(live: Live) -> None:
+    """После простоя сообщение, его правка и удаление приходят одной пачкой, а aiogram разбирает её
+    параллельно. Внутри чата порядок сохраняется: удаление показывает уже исправленный текст."""
+    w, api = live, live.api
+    await w.send(w.connection(OWNER, CONN))
+    t0 = w.ts()
+    before = len(api.to_owner())
+    await w.send(w.bmsg(CLIENT_CHAT, CLIENT, 70, FIRST), w.bedit(CLIENT_CHAT, CLIENT, 70, EDITED, t0),
+                 w.bdeleted(CLIENT_CHAT, [70]))
+    m = await w.repo.find_message(CLIENT_ID, 70)
+    assert m is not None and m.text == EDITED and m.version == 2 and m.deleted_at is not None
+    notes = [c.text for c in api.to_owner()[before:]]
+    assert len(notes) == 2 and notes[0].startswith("✏️") and notes[1].startswith("🗑")
+    assert FIRST in notes[0] and EDITED in notes[0]
+    assert EDITED in notes[1] and FIRST not in notes[1]

@@ -44,27 +44,31 @@ async def on_connection(bc: BusinessConnection, app: App) -> None:
 @safe
 async def on_business_message(message: Message, app: App) -> None:
     had_owner = app.owner_id is not None
-    inc = await spy.on_message(app, message)
-    if inc is None:
-        return
+    # Замок берётся до первого await: апдейты чата обрабатываются в порядке пачки getUpdates.
+    async with app.archive_lock(message.chat.id):
+        inc = await spy.on_message(app, message)
+        if inc is None:
+            return
+        if inc.is_owner:
+            # Наш же ответ, автоответ Telegram или отложенное сообщение не считаются ручным ответом.
+            if not inc.bot_sent and not inc.from_offline:
+                await secretary.on_owner_message(app, inc)
+        else:
+            await secretary.on_client_message(app, inc)
     if not had_owner:
         await setup_commands(app)
-    if inc.is_owner:
-        # Наш же ответ, автоответ Telegram или отложенное сообщение не считаются ручным ответом.
-        if not inc.bot_sent and not inc.from_offline:
-            await secretary.on_owner_message(app, inc)
-        return
-    await secretary.on_client_message(app, inc)
 
 
 @safe
 async def on_edited(message: Message, app: App) -> None:
-    await spy.on_edit(app, message)
+    async with app.archive_lock(message.chat.id):
+        await spy.on_edit(app, message)
 
 
 @safe
 async def on_deleted(event: BusinessMessagesDeleted, app: App) -> None:
-    await spy.on_deleted(app, event)
+    async with app.archive_lock(event.chat.id):
+        await spy.on_deleted(app, event)
 
 
 def build_router() -> Router:

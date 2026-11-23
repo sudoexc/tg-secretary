@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from datetime import datetime, time
@@ -67,6 +68,8 @@ class App:
         self.owner_id: int | None = settings.owner_id
         self.kb = KB(settings.kb_dir, settings.kb_default_dir)
         self._chat_locks: dict[int, asyncio.Lock] = {}
+        # Слабые ссылки: замок живёт, пока его держат или ждут, флуд чужих чатов не копит память.
+        self._archive_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
         self._connections: dict[str, Connection] = {}
         # Чужие подключения: только id в памяти, в базу ничего. Повторные апдейты без запроса в Telegram.
         self._foreign: OrderedDict[str, None] = OrderedDict()
@@ -96,6 +99,14 @@ class App:
         lock = self._chat_locks.get(chat_id)
         if lock is None:
             lock = self._chat_locks[chat_id] = asyncio.Lock()
+        return lock
+
+    def archive_lock(self, chat_id: int) -> asyncio.Lock:
+        """Апдейты Business одного чата по очереди: aiogram разбирает пачку параллельно, и правка или удаление
+        не должны обогнать само сообщение. Отдельно от chat_lock: тот держит ответ секретаря секундами."""
+        lock = self._archive_locks.get(chat_id)
+        if lock is None:
+            lock = self._archive_locks[chat_id] = asyncio.Lock()
         return lock
 
     # --- настройки ----------------------------------------------------------
