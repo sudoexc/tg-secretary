@@ -314,3 +314,45 @@ def test_style_has_no_invented_facts() -> None:
     style = (Path(__file__).resolve().parent.parent / "kb" / "style.md").read_text(encoding="utf-8")
     for bad in ("на встрече", "бугун ози йозади", "по скидке решает"):
         assert bad not in style.lower()
+
+
+# --- деплой ------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_deploy_files_match_spec() -> None:
+    docker = (ROOT / "Dockerfile").read_text()
+    assert docker.startswith("FROM python:3.12-slim") and "--uid 10001" in docker and "COPY kb ./kb" in docker
+    assert 'VOLUME ["/app/data"]' in docker and "USER kotib" in docker
+    compose = (ROOT / "docker-compose.yml").read_text()
+    for needle in ("  tg-secretary:", "container_name: tg-secretary", "restart: unless-stopped", "mem_limit: 384m",
+                   "driver: json-file", 'max-size: "10m"', 'max-file: "3"', "./data:/app/data"):
+        assert needle in compose, needle
+    assert "ports:" not in compose
+    deploy = (ROOT / "deploy.sh").read_text()
+    assert '-o IdentitiesOnly=yes -i "$HOME/.ssh/id_ed25519"' in deploy
+    assert 'HOST="root@62.83.87.250"' in deploy and 'DIR="/opt/tg-secretary"' in deploy
+    excludes = {line.strip().rstrip("\\").strip() for line in deploy.splitlines() if "--exclude=" in line}
+    for path in (".venv", "data", ".env", ".git", "tests", ".pytest_cache"):
+        assert f"--exclude=/{path}" in excludes, path
+    assert "docker compose up -d --build" in deploy and "logs --tail" in deploy
+
+
+def test_deploy_script_does_nothing_when_sourced(tmp_path: Path) -> None:
+    """source deploy.sh только объявляет функцию: ни ssh, ни rsync, ни set -e и cd в вызывающем shell."""
+    import subprocess
+
+    stubs = tmp_path / "stubs"
+    stubs.mkdir()
+    calls = tmp_path / "calls.log"
+    for name in ("ssh", "rsync", "docker"):
+        stub = stubs / name
+        stub.write_text(f'#!/bin/sh\necho "{name} $*" >> "{calls}"\n')
+        stub.chmod(0o755)
+    script = (f'cd "{tmp_path}" && source "{ROOT / "deploy.sh"}"; '
+              'echo "rc=$? pwd=$PWD"; type -t deploy; case $- in *e*) echo errexit;; esac')
+    env = {"PATH": f"{stubs}:/usr/bin:/bin", "HOME": str(tmp_path)}
+    out = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=20)
+    assert out.stdout.split() == ["rc=0", f"pwd={tmp_path}", "function"], out.stdout + out.stderr
+    assert not calls.exists()
