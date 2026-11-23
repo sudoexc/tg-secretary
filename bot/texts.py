@@ -22,6 +22,21 @@ VOICE_RECEIVED = {
     "uz": "Ovozli xabarni oldim, Javohirga yetkazaman.",
     "en": "Got your voice message, I will pass it to Javohir.",
 }
+# То же, когда это первое сообщение ассистента в разговоре: сначала представиться.
+VOICE_INTRO = {
+    "ru": "Здравствуйте, я ассистент Джавохира, он сейчас занят. Голосовое получил, передам ему.",
+    "uz": "Assalomu alaykum, men Javohirning assistentiman, u hozir band. Ovozli xabarni oldim, unga yetkazaman.",
+    "en": "Hello, I am Javohir's assistant, he is busy right now. Got your voice message, I will pass it to him.",
+}
+
+# Секретарь владельцу
+UNKNOWN_VOICE = ("🎤 Голосовое от {who}. Чат ещё не разобран, расшифровки нет, клиенту ничего не ушло.\n"
+                 "Это клиент? 🤖 Отвечать: ассистент ответит ему.")
+CLASSIFY_FAILED = "ИИ не смог разобрать новый чат, клиенту ничего не ушло. Ответь сам или нажми «Пусть ведёт дальше»."
+LIMIT_CHAT = "Лимит ИИ: {n} ответов в этом чате за сутки. Клиенту больше не отвечаю."
+LIMIT_ALL = "Лимит ИИ: {n} ответов за сутки на все чаты. Клиенту не ответил."
+LIMIT_CHAT_CALLS = "Лимит ИИ: {n} вызовов модели в этом чате за сутки. Клиенту больше не отвечаю."
+LIMIT_ALL_CALLS = "Лимит ИИ: {n} вызовов модели за сутки на все чаты. Клиенту не ответил."
 
 # Песочница
 SANDBOX_ON = ("🧪 Песочница. Пиши как клиент, отвечу тем же движком, что и в чатах, без задержки. "
@@ -38,7 +53,9 @@ KB_WRONG_NAME = "Нужен файл с именем knowledge.md или style.m
 KB_DOWNLOAD_FAILED = "Не смог скачать файл, пришли ещё раз."
 
 PAUSE_USAGE = "Пример: /pause 2h, /pause 30m, /pause 1d"
-HOURS_USAGE = "Пример: /hours 20:00-09:00. Сейчас: {now}"
+HOURS_USAGE = ("Нерабочие часы и выходные для режима «вне работы»: /hours 20:00-09:00 вс "
+               "(дни: пн вт ср чт пт сб вс через запятую, «нет» без выходных). Сейчас: {now}")
+HOURS_BAD_DAYS = "Не понял дни: {raw}. Пиши пн, вт, ср, чт, пт, сб, вс через запятую или «нет». Ничего не менял."
 
 AI_OFF_KEY = "ИИ выключен: нет ключа {env}"
 

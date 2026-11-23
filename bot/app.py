@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from datetime import datetime, time
 from typing import Any
@@ -20,6 +21,8 @@ from .prompts import Line
 from .storage import Connection, Repo
 
 log = logging.getLogger(__name__)
+
+FOREIGN_CACHE = 1000  # сколько чужих подключений помним, чтобы не спрашивать Telegram на каждый апдейт
 
 # Рабочие настройки владельца (kv), меняются кнопками и командами.
 DEFAULTS: dict[str, str] = {
@@ -65,6 +68,8 @@ class App:
         self.kb = KB(settings.kb_dir, settings.kb_default_dir)
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._connections: dict[str, Connection] = {}
+        # Чужие подключения: только id в памяти, в базу ничего. Повторные апдейты без запроса в Telegram.
+        self._foreign: OrderedDict[str, None] = OrderedDict()
         self._claim_lock = asyncio.Lock()
         # Песочница /test: история в памяти, None = закрыта.
         self.sandbox: list[Line] | None = None
@@ -156,7 +161,8 @@ class App:
                 await self.repo.kv_set("owner_id", str(uid))
                 log.info("владелец зафиксирован: %s", uid)
         if uid != self.owner_id:
-            log.warning("чужое подключение %s от user %s: игнор", bc.id, uid)
+            if self._remember_foreign(bc.id):
+                log.warning("чужое подключение %s от user %s: игнор", bc.id, uid)
             return None
         rights = bc.rights
         can_reply = bool(rights.can_reply) if rights is not None else bool(bc.can_reply)
@@ -176,9 +182,19 @@ class App:
                 await self.notify(texts.CAN_REPLY_NOW)
         return conn
 
+    def _remember_foreign(self, conn_id: str) -> bool:
+        """Запомнить чужое подключение. True, если оно новое (тогда и стоит написать в лог)."""
+        if conn_id in self._foreign:
+            self._foreign.move_to_end(conn_id)
+            return False
+        self._foreign[conn_id] = None
+        while len(self._foreign) > FOREIGN_CACHE:
+            self._foreign.popitem(last=False)
+        return True
+
     async def owner_connection(self, conn_id: str | None) -> Connection | None:
         """Подключение, через которое пришёл апдейт, если оно владельца. Иначе None (апдейт игнорируем)."""
-        if not conn_id:
+        if not conn_id or conn_id in self._foreign:
             return None
         conn = self._connections.get(conn_id) or await self.repo.get_connection(conn_id)
         if conn is None:

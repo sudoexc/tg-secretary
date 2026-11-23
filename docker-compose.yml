@@ -6,6 +6,8 @@ services:
     image: tg-secretary:latest
     container_name: tg-secretary
     restart: unless-stopped
+    # Мягкая остановка: дождаться апдейтов в обработке и текущего ответа клиенту (см. bot/main.py).
+    stop_grace_period: 30s
     mem_limit: 384m
     env_file:
       - .env

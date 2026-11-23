@@ -26,6 +26,8 @@ CAPTION_LIMIT = 1024
 # Признаки одноразовых и самоуничтожающихся медиа, если Telegram их пришлёт (поля вне текущей схемы).
 EPHEMERAL_KEYS = ("ttl_seconds", "ttl_period", "self_destruct", "self_destruct_in", "view_once", "is_view_once",
                   "has_timer", "has_ttl")
+# Ключи extra, которые правка сообщения не стирает: автоответ Telegram и граница пачки нашего ответа.
+STICKY_EXTRA = ("offline", "upto")
 EXT = {"photo": ".jpg", "voice": ".ogg", "video_note": ".mp4", "video": ".mp4"}
 MEDIA_LABEL = {
     "photo": "фото", "video": "видео", "voice": "голосовое", "video_note": "кружок", "audio": "аудио",
@@ -50,6 +52,7 @@ class Incoming:
     conn: Connection
     chat_id: int
     message_id: int
+    date: datetime
     stored: StoredMessage | None
     is_owner: bool
     bot_sent: bool
@@ -180,6 +183,9 @@ def _date(msg: Message) -> datetime:
 
 
 def _stored(conn: Connection, msg: Message, ex: Extracted, is_owner: bool, bot_sent: bool) -> StoredMessage:
+    if msg.is_from_offline:
+        # Приветствие или «нет на месте» из Telegram Business: не ответ владельца, пачку клиента не закрывает.
+        ex.extra["offline"] = True
     return StoredMessage(
         connection_id=conn.id, chat_id=msg.chat.id, message_id=msg.message_id,
         from_id=msg.from_user.id if msg.from_user else None, is_owner=is_owner, is_bot_sent=bot_sent,
@@ -212,8 +218,9 @@ async def on_message(app: App, msg: Message) -> Incoming | None:
     name, username = counterpart_name(msg.chat)
     from_bot = bool(msg.from_user and msg.from_user.is_bot and not is_owner)
     await app.repo.touch_chat(chat_id, name, username, now, is_bot=None if is_owner else from_bot)
-    base = dict(conn=conn, chat_id=chat_id, message_id=msg.message_id, is_owner=is_owner or bot_sent,
-                bot_sent=bot_sent, from_offline=bool(msg.is_from_offline), from_bot=from_bot)
+    base = dict(conn=conn, chat_id=chat_id, message_id=msg.message_id, date=_date(msg),
+                is_owner=is_owner or bot_sent, bot_sent=bot_sent, from_offline=bool(msg.is_from_offline),
+                from_bot=from_bot)
     if is_ephemeral(msg):
         log.info("сообщение %s/%s защищено или одноразовое: не храним", chat_id, msg.message_id)
         return Incoming(stored=None, ephemeral=True, **base)
@@ -351,6 +358,10 @@ async def on_edit(app: App, msg: Message) -> None:
         return
     ex = extract(msg)
     new = _stored(conn, msg, ex, is_owner, bot_sent)
+    if old is not None:
+        for key in STICKY_EXTRA:
+            if key in old.extra:
+                new.extra.setdefault(key, old.extra[key])
     edited_at = datetime.fromtimestamp(msg.edit_date, tz=timezone.utc) if msg.edit_date else now
     if old is None:
         await app.repo.save_message(new)

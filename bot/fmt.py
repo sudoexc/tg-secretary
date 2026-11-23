@@ -1,8 +1,9 @@
 """Форматирование для сообщений владельцу (HTML): экранирование, имена, ссылки, время."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, tzinfo
-from html import escape
+from html import escape, unescape
 
 from .storage import Chat
 
@@ -14,6 +15,35 @@ def esc(text: str | None) -> str:
 def trunc(text: str, limit: int) -> str:
     text = text or ""
     return text if len(text) <= limit else text[: max(0, limit - 1)].rstrip() + "…"
+
+
+# Telegram режет сообщение длиннее 4096 символов после разбора разметки, считая в UTF-16.
+MESSAGE_LIMIT = 4096
+_TAG = re.compile(r"<[^>]+>")
+
+
+def tg_len(text: str) -> int:
+    """Длина так, как её считает Telegram: в единицах UTF-16 (эмодзи бывают по 2)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def visible_len(html: str) -> int:
+    """Длина HTML-текста после разбора разметки: без тегов, сущности как один символ."""
+    return tg_len(unescape(_TAG.sub("", html)))
+
+
+def fit(text: str, units: int) -> str:
+    """Обрезать до units единиц UTF-16 с «…» в конце."""
+    if tg_len(text) <= units:
+        return text
+    out, used = [], 0
+    for ch in text:
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if used + w > units - 1:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out).rstrip() + "…"
 
 
 def chat_name(chat: Chat | None, fallback_id: int | None = None) -> str:

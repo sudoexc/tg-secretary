@@ -13,6 +13,8 @@ DEFAULT_MODELS = {"anthropic": "claude-sonnet-5-5", "openai": "gpt-5.4-mini"}
 DEFAULT_STT_MODEL = "gpt-4o-mini-transcribe"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+# Потолок вызовов модели (классификация, решения без ответа, расшифровка) на один разрешённый ответ.
+CALLS_PER_REPLY = 3
 # kb/ рядом с пакетом: /app/kb в образе, корень репозитория локально.
 PACKAGE_KB = Path(__file__).resolve().parent.parent / "kb"
 
@@ -33,6 +35,14 @@ class Settings:
     kb_default_dir: Path
     chat_daily_limit: int = 12
     total_daily_limit: int = 150
+
+    @property
+    def chat_call_limit(self) -> int:
+        return self.chat_daily_limit * CALLS_PER_REPLY
+
+    @property
+    def total_call_limit(self) -> int:
+        return self.total_daily_limit * CALLS_PER_REPLY
 
     @property
     def tz(self) -> ZoneInfo:

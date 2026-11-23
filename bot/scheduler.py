@@ -15,6 +15,10 @@ from .logs import log_exc
 log = logging.getLogger(__name__)
 
 TICK_SECONDS = 10
+# После старта ждём, пока поллинг разберёт бэклог: ответ владельца, пришедший за время простоя,
+# должен попасть в базу раньше, чем планировщик исполнит просроченный ответ.
+STARTUP_WAIT = 60
+STARTUP_GRACE = 3
 RETENTION_AT = time(4, 0)
 MESSAGES_DAYS = 60
 MEDIA_DAYS = 30
@@ -28,25 +32,41 @@ class RetentionReport:
     media: int
 
 
-async def tick(app: App) -> int:
-    """Один проход: все наступившие ответы и, если пора, чистка. Возвращает число обработанных ответов."""
+async def tick(app: App, stop: asyncio.Event | None = None) -> int:
+    """Один проход: все наступившие ответы и, если пора, чистка. Возвращает число обработанных ответов.
+    Остановка (stop) не прерывает текущий ответ, но новые не берутся."""
     done = 0
     for p in await app.repo.due_pending(app.now()):
+        if stop is not None and stop.is_set():
+            return done
         await secretary.process_pending(app, p)
         done += 1
     await maybe_retention(app)
     return done
 
 
-async def run(app: App) -> None:
-    while True:
+async def _wait(event: asyncio.Event, timeout: float) -> bool:
+    try:
+        await asyncio.wait_for(event.wait(), timeout)
+        return True
+    except TimeoutError:
+        return False
+
+
+async def run(app: App, *, stop: asyncio.Event | None = None, ready: asyncio.Event | None = None) -> None:
+    """Цикл каждые 10 с. ready: поллинг догнал бэклог (ждём не дольше STARTUP_WAIT). stop: мягкая остановка."""
+    stop = stop or asyncio.Event()
+    if ready is not None:
+        await _wait(ready, STARTUP_WAIT)
+        await _wait(stop, STARTUP_GRACE)
+    while not stop.is_set():
         try:
-            await tick(app)
+            await tick(app, stop)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log_exc(log, "планировщик", e)
-        await asyncio.sleep(TICK_SECONDS)
+        await _wait(stop, TICK_SECONDS)
 
 
 async def maybe_retention(app: App) -> RetentionReport | None:

@@ -336,7 +336,8 @@ class Repo:
     # --- сообщения ----------------------------------------------------------
 
     async def save_message(self, m: StoredMessage) -> None:
-        """Новое сообщение. Повтор того же id (наш ответ уже записан при отправке) не затирает файл."""
+        """Новое сообщение. Повтор того же id (наш ответ уже записан при отправке) не затирает файл,
+        а extra сливается: граница пачки (upto) у нашего ответа не теряется."""
         await self.conn.execute(
             """INSERT INTO messages(connection_id, chat_id, message_id, from_id, is_owner, is_bot_sent, date,
                    kind, text, file_id, file_unique_id, file_size, file_name, mime, extra, reply_to)
@@ -350,7 +351,9 @@ class Repo:
                    file_size = COALESCE(excluded.file_size, messages.file_size),
                    file_name = COALESCE(excluded.file_name, messages.file_name),
                    mime = COALESCE(excluded.mime, messages.mime),
-                   extra = excluded.extra, reply_to = excluded.reply_to""",
+                   extra = CASE WHEN messages.extra IS NULL THEN excluded.extra
+                                ELSE json_patch(messages.extra, COALESCE(excluded.extra, '{}')) END,
+                   reply_to = excluded.reply_to""",
             (m.connection_id, m.chat_id, m.message_id, m.from_id, int(m.is_owner), int(m.is_bot_sent),
              iso(m.date), m.kind, m.text, m.file_id, m.file_unique_id, m.file_size, m.file_name, m.mime,
              json.dumps(m.extra, ensure_ascii=False) if m.extra else None, m.reply_to))
@@ -558,6 +561,10 @@ class Repo:
                                (limit,))
         return [Lead.from_row(r) for r in rows]
 
+    async def count_open_leads(self) -> int:
+        r = await self._one("SELECT COUNT(*) AS n FROM leads WHERE status = 'open'")
+        return int(r["n"]) if r else 0
+
     async def close_lead(self, lead_id: int, now: datetime) -> bool:
         cur = await self.conn.execute(
             "UPDATE leads SET status = 'closed', updated_at = ? WHERE id = ? AND status = 'open'",
@@ -582,6 +589,16 @@ class Repo:
         else:
             r = await self._one("SELECT COUNT(*) AS n FROM ai_log WHERE kind = 'reply' AND at >= ? AND chat_id = ?",
                                 (iso(since), chat_id))
+        return int(r["n"]) if r else 0
+
+    async def count_calls(self, since: datetime, chat_id: int | None = None) -> int:
+        """Вызовы модели и расшифровки (в том числе без ответа клиенту): для лимита на стоимость."""
+        sql = "SELECT COUNT(*) AS n FROM ai_log WHERE kind IN ('decide', 'classify', 'stt') AND at >= ?"
+        args: tuple[Any, ...] = (iso(since),)
+        if chat_id is not None:
+            sql += " AND chat_id = ?"
+            args += (chat_id,)
+        r = await self._one(sql, args)
         return int(r["n"]) if r else 0
 
     async def usage_since(self, since: datetime) -> Usage:

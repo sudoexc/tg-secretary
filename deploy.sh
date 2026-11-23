@@ -38,7 +38,8 @@ rsync -az --delete \
 cd $DIR
 if [ ! -f .env ]; then echo 'На сервере нет $DIR/.env: создай его по .env.example (chmod 600).' >&2; exit 1; fi
 chmod 600 .env
-mkdir -p data && chown 10001:10001 data
+# Архив личных переписок: только uid контейнера (и root). Внутри файлы создаются с umask 077.
+mkdir -p data && chown 10001:10001 data && chmod 700 data && chmod -R go-rwx data
 docker compose up -d --build </dev/null
 sleep 5
 docker compose ps </dev/null

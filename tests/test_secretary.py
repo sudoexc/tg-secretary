@@ -1,6 +1,9 @@
 """Секретарь: задержка, отмена, сдвиг дедлайна, takeover, лимиты, режимы, away, отправка и handoff."""
 from __future__ import annotations
 
+import asyncio
+import json
+
 import pytest
 
 from bot import texts
@@ -101,6 +104,14 @@ async def test_unknown_classification_failure_keeps_unknown(ready: World) -> Non
     assert chat and chat.chat_class == "unknown"
     assert w.session.to_client() == []
     assert len(w.llm.of("chat_class")) == 2
+    # Новый лид не теряется молча: владельцу handoff, но не чаще раза в 6 часов на чат
+    cards = [c for c in w.session.to_owner() if "Нужен ты" in c.text]
+    assert len(cards) == 1 and texts.CLASSIFY_FAILED in cards[0].text
+    w.llm.klass("снова", "мимо")
+    w.clock.advance(hours=1)
+    await w.client_says("Алло")
+    await w.wait(6)
+    assert len([c for c in w.session.to_owner() if "Нужен ты" in c.text]) == 1
 
 
 async def test_owner_reply_cancels_pending_and_takeover(ready: World) -> None:
@@ -442,3 +453,180 @@ async def test_owner_writes_while_typing(ready: World) -> None:
     assert w.session.of("sendChatAction", chat_id=CLIENT)
     assert w.session.to_client() == []
     assert (await w.app.repo.pending_list(CLIENT))[-1].status == "cancelled"
+
+
+# --- после ревью ---------------------------------------------------------------
+
+
+def _rows(user: str) -> list[dict]:  # type: ignore[type-arg]
+    chat = user.split("<chat>\n", 1)[1].split("\n</chat>", 1)[0]
+    return [json.loads(ln) for ln in chat.splitlines()]
+
+
+async def _statuses(w: World, chat_id: int = CLIENT) -> list[tuple[str, str | None]]:
+    return [(p.status, p.reason) for p in await w.app.repo.pending_list(chat_id)]
+
+
+async def test_offline_autoreply_does_not_cut_batch(ready: World) -> None:
+    """Приветствие или «нет на месте» из Telegram Business не обрывает пачку клиента."""
+    w = ready
+    await w.client_says("Здравствуйте, нужен сайт")
+    await w.owner_says("Сейчас меня нет на месте, отвечу позже", offline=True)
+    await w.wait(6)
+    assert len(w.session.to_client()) == 1
+    assert await _statuses(w) == [("done", "replied")]
+    rows = _rows(w.llm.of("secretary_reply")[-1]["user"])
+    assert [r["who"] for r in rows] == ["Собеседник", "Автоответ"]
+
+
+async def test_message_during_reply_gets_its_own_answer(ready: World) -> None:
+    """Клиент дописал, пока ИИ думал над прошлой пачкой: это сообщение получает следующий ответ."""
+    w = ready
+    await w.client_says("Нужен сайт")
+    w.clock.advance(minutes=6)
+    original = w.llm.complete
+    wrote: list[int] = []
+
+    async def slow(**kw):  # type: ignore[no-untyped-def]
+        res = await original(**kw)
+        if kw["schema_name"] == "secretary_reply" and not wrote:
+            wrote.append(await w.client_says("И ещё бот для заявок"))
+        return res
+
+    w.llm.complete = slow  # type: ignore[method-assign]
+    await w.tick()
+    assert len(w.session.to_client()) == 1
+    await w.wait(6)
+    assert len(w.session.to_client()) == 2
+    assert await _statuses(w) == [("done", "replied"), ("done", "replied")]
+    assert "И ещё бот для заявок" in w.llm.of("secretary_reply")[-1]["user"]
+
+
+async def test_requeued_after_sent_reply_does_not_resend(ready: World) -> None:
+    w = ready
+    await w.client_says("Нужен сайт")
+    await w.wait(6)
+    assert len(w.session.to_client()) == 1
+    p = (await w.app.repo.pending_list(CLIENT))[-1]
+    await w.app.repo.conn.execute("UPDATE pending SET status = 'running' WHERE id = ?", (p.id,))
+    assert await w.app.repo.requeue_running(w.app.now()) == 1
+    await w.tick()
+    assert len(w.session.to_client()) == 1
+    assert (await _statuses(w))[-1] == ("skipped", "no_batch")
+
+
+async def test_shutdown_mid_reply_is_retried_after_restart(ready: World) -> None:
+    """SIGTERM посреди ответа: строка не помечается error, после рестарта ответ уходит."""
+    w = ready
+    await w.client_says("Нужен сайт")
+    w.clock.advance(minutes=6)
+    original = w.llm.complete
+    entered = asyncio.Event()
+
+    async def hang(**kw):  # type: ignore[no-untyped-def]
+        if kw["schema_name"] == "secretary_reply":
+            entered.set()
+            await asyncio.Event().wait()
+        return await original(**kw)
+
+    w.llm.complete = hang  # type: ignore[method-assign]
+    task = asyncio.create_task(w.tick())
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await _statuses(w) == [("running", None)]
+    w.llm.complete = original  # type: ignore[method-assign]
+    assert await w.app.repo.requeue_running(w.app.now()) == 1
+    await w.tick()
+    assert len(w.session.to_client()) == 1
+
+
+async def test_call_limit_caps_silent_decisions(ready: World) -> None:
+    """Решения без ответа клиенту тоже считаются: потолок вызовов 3 на каждый разрешённый ответ."""
+    w = ready
+    object.__setattr__(w.app.s, "chat_daily_limit", 2)
+    w.llm.defaults["secretary_reply"] = {"reply": None, "handoff": False, "handoff_reason": None, "lead": None,
+                                         "lead_ready": False, "language": "ru"}
+    for i in range(10):
+        await w.client_says(f"ок {i}")
+        await w.wait(6)
+    assert len(w.llm.of("secretary_reply")) + len(w.llm.of("chat_class")) == w.app.s.chat_call_limit == 6
+    assert w.session.to_client() == []
+    assert len([t for t in w.session.owner_texts() if "вызовов модели в этом чате" in t]) == 1
+
+
+async def test_total_call_limit(ready: World) -> None:
+    w = ready
+    object.__setattr__(w.app.s, "total_daily_limit", 1)  # потолок вызовов 3 на все чаты
+    w.llm.defaults["secretary_reply"] = {"reply": None, "handoff": False, "handoff_reason": None, "lead": None,
+                                         "lead_ready": False, "language": "ru"}
+    for i in range(2):
+        await w.client_says(f"ок {i}")
+        await w.wait(6)
+    await w.client_says("Есть заказ", peer=w.friend)
+    await w.wait(6)
+    assert len(w.llm.calls) == 3
+    assert any("вызовов модели за сутки на все чаты" in t for t in w.session.owner_texts())
+
+
+async def test_greeting_only_keeps_chat_unknown(ready: World) -> None:
+    """Одно приветствие не делает клиента «личным» навсегда: класс не фиксируется, следующее сообщение разберём."""
+    w = ready
+    w.llm.klass({"chat_class": "unclear", "reason": "только приветствие"})
+    await w.client_says("Ассаламу алейкум")
+    await w.wait(6)
+    chat = await w.app.repo.get_chat(CLIENT)
+    assert chat and chat.chat_class == "unknown"
+    assert w.session.to_client() == []
+    assert not [c for c in w.session.to_owner() if "Новый клиент" in c.text]
+    await w.client_says("сайт керак эди")
+    assert await w.app.repo.waiting_pending(CLIENT) is not None
+    await w.wait(6)
+    assert len(w.llm.of("chat_class")) == 2
+    chat = await w.app.repo.get_chat(CLIENT)
+    assert chat and chat.chat_class == "business"
+    assert len(w.session.to_client()) == 1
+    assert len([c for c in w.session.to_owner() if "Новый клиент" in c.text]) == 1
+
+
+async def test_sticker_only_is_not_classified(ready: World) -> None:
+    w = ready
+    await w.client_says(None, kind="sticker")
+    await w.wait(6)
+    assert w.llm.of("chat_class") == []
+    assert await _statuses(w) == [("skipped", "unclear")]
+    chat = await w.app.repo.get_chat(CLIENT)
+    assert chat and chat.chat_class == "unknown"
+
+
+async def test_owner_message_after_downtime_uses_its_date(ready: World) -> None:
+    w = ready
+    await w.client_says("Нужен сайт")
+    written = w.app.now()
+    upd = w.tg.bmsg(w.client, w.owner, "Сейчас отвечу")
+    w.clock.advance(minutes=20)  # бот лежал: апдейт обработан позже, чем владелец написал
+    await w.feed(upd)
+    chat = await w.app.repo.get_chat(CLIENT)
+    assert chat and chat.last_owner_msg_at == written
+    assert await w.app.repo.waiting_pending(CLIENT) is None
+
+
+async def test_hours_day_names_and_bad_days(ready: World) -> None:
+    w = ready
+    await w.dm("/hours 20:00-09:00 сб,вс")
+    assert await w.app.get("away_days") == "6,7"
+    assert "выходные: сб, вс" in w.session.owner_texts()[-1]
+    await w.dm("/hours 21:00-08:00 выходной")
+    assert "Не понял дни" in w.session.owner_texts()[-1]
+    assert await w.app.get("away_days") == "6,7" and await w.app.get("away_from") == "20:00"
+    await w.dm("/hours 21:00-08:00")  # без дней: выходные не трогаем
+    assert await w.app.get("away_days") == "6,7" and await w.app.get("away_from") == "21:00"
+    await w.dm("/hours 21:00-08:00 воскресенье")
+    assert await w.app.get("away_days") == "7"
+    await w.dm("/hours 21:00-08:00 нет")
+    assert await w.app.get("away_days") == ""
+    from bot.panel import COMMANDS
+
+    hours = next(c for c in COMMANDS if c.command == "hours")
+    assert hours.description.startswith("Нерабочие часы")

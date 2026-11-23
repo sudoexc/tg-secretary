@@ -1,6 +1,8 @@
 """Владелец один: чужие подключения, сообщения, правки и удаления не хранятся; кнопки и команды только ему."""
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from bot import texts
@@ -124,3 +126,19 @@ async def test_owner_callbacks_validated(ready: World) -> None:
     assert answers.count(texts.STALE_BUTTON) == 6
     assert await w.app.get("delay") == "5"
     assert await w.app.get("mode") == "always"
+
+
+async def test_foreign_connection_asked_once(ready: World, caplog: pytest.LogCaptureFixture) -> None:
+    """Чужое подключение запоминается в памяти: флуд из его чатов не гонит getBusinessConnection на каждый апдейт."""
+    w = ready
+    w.session.connections["bc_y"] = w.tg.connection_json(w.stranger, "bc_y")
+    victim = w.tg.user(123123, "Жертва")
+    with caplog.at_level(logging.WARNING, logger="bot.app"):
+        for i in range(10):
+            await w.feed(w.tg.bmsg(victim, victim, f"флуд {i}", conn="bc_y"))
+        await w.feed(w.tg.bedit(victim, victim, 5, "x", conn="bc_y"))
+        await w.feed(w.tg.bdeleted(victim, [5], conn="bc_y"))
+        await w.connect(w.stranger, conn="bc_y")
+    assert len(w.session.of("getBusinessConnection")) == 1
+    assert sum("чужое подключение" in r.getMessage() for r in caplog.records) == 1
+    assert await _count(w.app, "messages") == 0 and await _count(w.app, "connections") == 1

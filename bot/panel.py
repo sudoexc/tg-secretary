@@ -30,7 +30,7 @@ COMMANDS = [
     BotCommand(command="stop", description="Выйти из песочницы"),
     BotCommand(command="pause", description="Пауза секретаря: /pause 2h"),
     BotCommand(command="resume", description="Снять паузу"),
-    BotCommand(command="hours", description="Рабочие часы для режима «вне работы»"),
+    BotCommand(command="hours", description="Нерабочие часы: /hours 20:00-09:00 вс"),
 ]
 
 
@@ -106,8 +106,7 @@ async def menu_view(app: App) -> tuple[str, InlineKeyboardMarkup]:
         sec = texts.MODE_NAMES.get(mode, mode)
         if mode == "away":
             start, end, days = await app.away_window()
-            off = ", ".join(DAY_NAMES[d - 1] for d in sorted(days)) or "нет"
-            sec += f" (с {start.strftime('%H:%M')} до {end.strftime('%H:%M')}, выходные: {off})"
+            sec += f" (с {start.strftime('%H:%M')} до {end.strftime('%H:%M')}, выходные: {days_text(days)})"
         sec += f", задержка {delay} мин, тишина после тебя {takeover} ч"
         paused = await app.paused_until()
         if paused:
@@ -129,22 +128,43 @@ async def menu_view(app: App) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), kb.menu(mode, delay, spy_del, spy_edit, spy_mine)
 
 
+# Запас до лимита Telegram 4096: строка «и ещё N» и погрешность.
+LIST_BUDGET = 3800
+
+
+def _budget_rows(head: str, rows: list[str], tail: str) -> list[str]:
+    """Сколько строк списка влезает в одно сообщение вместе с шапкой и строкой «и ещё N»."""
+    used = fmt.visible_len(head) + fmt.visible_len(tail.format(n=len(rows))) + 1
+    out: list[str] = []
+    for row in rows:
+        size = fmt.visible_len(row) + 1
+        if used + size > LIST_BUDGET:
+            break
+        out.append(row)
+        used += size
+    return out
+
+
 async def chats_view(app: App) -> tuple[str, InlineKeyboardMarkup]:
     items = await app.repo.recent_chats(20)
     if not items:
         return "💬 Чатов пока нет. Они появятся, когда тебе напишут.", kb.back()
-    rows = ["💬 <b>Последние чаты</b>: класс, режим ИИ (авто: по классу)"]
-    for c in items:
-        rows.append(f"{fmt.link(c, c.chat_id)}: {texts.CLASS_NAMES.get(c.chat_class, c.chat_class)}, "
-                    f"{texts.AI_MODE_NAMES.get(c.ai_mode, c.ai_mode)}")
-    return "\n".join(rows), kb.chats(items)
+    head = "💬 <b>Последние чаты</b>: класс, режим ИИ (авто: по классу)"
+    rows = [f"{fmt.link(c, c.chat_id)}: {texts.CLASS_NAMES.get(c.chat_class, c.chat_class)}, "
+            f"{texts.AI_MODE_NAMES.get(c.ai_mode, c.ai_mode)}" for c in items]
+    shown = _budget_rows(head, rows, "")
+    return "\n".join([head, *shown]), kb.chats(items[:len(shown)])
 
 
 async def leads_view(app: App) -> tuple[str, InlineKeyboardMarkup]:
+    """Открытые лиды одним сообщением в пределах лимита Telegram. Не влезли: «и ещё N», кнопки только у показанных."""
     items = await app.repo.open_leads()
     if not items:
         return "📋 Открытых лидов нет.", kb.back()
-    rows = [f"📋 <b>Открытые лиды</b>: {len(items)}"]
+    total = await app.repo.count_open_leads()
+    head = f"📋 <b>Открытые лиды</b>: {total}"
+    tail = "и ещё {n}: закрой показанные, покажу следующие"
+    rows: list[str] = []
     names: dict[int, str] = {}
     for i, lead in enumerate(items, 1):
         chat = await app.repo.get_chat(lead.chat_id)
@@ -158,7 +178,11 @@ async def leads_view(app: App) -> tuple[str, InlineKeyboardMarkup]:
             parts.append(fmt.esc(fmt.trunc(lead.summary, 160)))
         upd = fmt.when(lead.updated_at, app.s.tz, app.now())
         rows.append(f"{i}. {fmt.link(chat, lead.chat_id)}: {', '.join(parts) or 'без деталей'} ({upd})")
-    return "\n".join(rows), kb.leads(items, names)
+    shown = _budget_rows(head, rows, tail)
+    out = [head, *shown]
+    if total > len(shown):
+        out.append(tail.format(n=total - len(shown)))
+    return "\n".join(out), kb.leads(items[:len(shown)], names)
 
 
 async def kb_view(app: App) -> tuple[str, InlineKeyboardMarkup]:
@@ -200,6 +224,32 @@ async def _append(cq: CallbackQuery, bot: Bot, line: str) -> None:
 # --- команды ----------------------------------------------------------------------
 
 DAY_NAMES = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+NO_DAYS = ("нет", "-", "0")
+# Первые две буквы дня: «пн», «понедельник», «сб», «суббота», «вс», «воскресенье».
+DAY_PREFIX = {"пн": 1, "по": 1, "вт": 2, "ср": 3, "чт": 4, "че": 4, "пт": 5, "пя": 5, "сб": 6, "су": 6,
+              "вс": 7, "во": 7}
+
+
+def parse_days(raw: str) -> frozenset[int] | None:
+    """«сб,вс», «6,7», «пт сб» → номера ISO. «нет» → пусто. Непонятное → None (ничего не меняем)."""
+    tokens = [t for t in re.split(r"[\s,;]+", raw.strip().lower()) if t]
+    if not tokens:
+        return None
+    if len(tokens) == 1 and tokens[0] in NO_DAYS:
+        return frozenset()
+    days: set[int] = set()
+    for t in tokens:
+        if t.isdigit() and 1 <= int(t) <= 7:
+            days.add(int(t))
+        elif t[:2] in DAY_PREFIX:
+            days.add(DAY_PREFIX[t[:2]])
+        else:
+            return None
+    return frozenset(days)
+
+
+def days_text(days: frozenset[int]) -> str:
+    return ", ".join(DAY_NAMES[d - 1] for d in sorted(days)) or "нет"
 DURATION = re.compile(r"^(\d{1,4})\s*([mhdмчд]?)\w*$", re.I)
 
 
@@ -264,10 +314,10 @@ def build_router() -> Router:
 
     @r.message(Command("hours"))
     async def on_hours(message: Message, command: CommandObject, app: App) -> None:
+        """Нерабочие часы и выходные: в это время отвечает режим «вне работы»."""
         start, end, days = await app.away_window()
-        off = ", ".join(DAY_NAMES[d - 1] for d in sorted(days)) or "нет"
-        now_txt = f"нерабочее с {start.strftime('%H:%M')} до {end.strftime('%H:%M')}, выходные: {off}"
-        args = (command.args or "").replace("–", "-").split()
+        now_txt = f"нерабочее с {start.strftime('%H:%M')} до {end.strftime('%H:%M')}, выходные: {days_text(days)}"
+        args = (command.args or "").replace("–", "-").replace("—", "-").split(maxsplit=1)
         if not args:
             await message.answer(texts.HOURS_USAGE.format(now=now_txt))
             return
@@ -277,12 +327,18 @@ def build_router() -> Router:
         if a is None or b is None or a == b:
             await message.answer(texts.HOURS_USAGE.format(now=now_txt))
             return
+        picked = days
+        if len(args) > 1:
+            parsed = parse_days(args[1])
+            if parsed is None:
+                await message.answer(texts.HOURS_BAD_DAYS.format(raw=fmt.esc(args[1])))
+                return
+            picked = parsed
         await app.set("away_from", a.strftime("%H:%M"))
         await app.set("away_to", b.strftime("%H:%M"))
-        if len(args) > 1:
-            picked = sorted({int(x) for x in args[1].split(",") if x.isdigit() and 1 <= int(x) <= 7})
-            await app.set("away_days", ",".join(map(str, picked)))
-        await message.answer(f"✅ Нерабочее время: с {a.strftime('%H:%M')} до {b.strftime('%H:%M')}.")
+        await app.set("away_days", ",".join(map(str, sorted(picked))))
+        await message.answer(f"✅ Нерабочее время: с {a.strftime('%H:%M')} до {b.strftime('%H:%M')}, "
+                             f"выходные: {days_text(picked)}.")
 
     @r.message(F.document)
     async def on_document(message: Message, app: App, bot: Bot) -> None:
@@ -423,6 +479,9 @@ def build_router() -> Router:
     return r
 
 
+SANDBOX_BUDGET = 3900
+
+
 async def _enter_sandbox(app: App, chat_id: int) -> None:
     app.sandbox = []
     text = texts.SANDBOX_ON if app.llm else texts.SANDBOX_ON + "\n" + texts.AI_OFF_KEY.format(env=app.s.llm_key_env)
@@ -445,5 +504,7 @@ async def _sandbox_reply(app: App, message: Message) -> None:
         await message.answer(f"{texts.SANDBOX_FAILED}\n<blockquote expandable><code>{raw}</code></blockquote>")
         return
     head = fmt.esc(d.reply) if d.reply else f"<i>{texts.SANDBOX_NO_REPLY}</i>"
-    js = fmt.esc(fmt.trunc(secretary.decision_json(d), 3000))
+    # Ответ до 1500 символов плюс JSON решения: вместе не длиннее лимита Telegram.
+    room = max(200, SANDBOX_BUDGET - fmt.visible_len(head) - 2)
+    js = fmt.esc(fmt.fit(secretary.decision_json(d), room))
     await message.answer(f"{head}\n\n<blockquote expandable><code>{js}</code></blockquote>")

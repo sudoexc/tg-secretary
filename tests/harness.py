@@ -121,6 +121,7 @@ class MockSession(BaseSession):
         self.connections: dict[str, dict[str, Any]] = {}  # для getBusinessConnection
         self._ids = MESSAGE_IDS
         self.downloads: list[str] = []
+        self.updates: list[list[dict[str, Any]]] = []  # пачки для getUpdates
 
     async def close(self) -> None:
         pass
@@ -177,6 +178,8 @@ class MockSession(BaseSession):
             return {"file_id": fid, "file_unique_id": f"u-{fid}", "file_size": 10, "file_path": f"files/{fid}"}
         if name == "getBusinessConnection":
             return self.connections[data["business_connection_id"]]
+        if name == "getUpdates":
+            return self.updates.pop(0) if self.updates else []
         if name in ("sendMessage", "editMessageText"):
             return self._message(data, text=data.get("text"))
         if name in ("sendPhoto",):

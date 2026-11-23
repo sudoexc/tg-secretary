@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -14,13 +15,19 @@ from aiogram.types import ErrorEvent
 from . import config, handlers, panel, scheduler, texts, tg
 from .app import App
 from .llm import build_llm, build_stt
-from .logs import log_exc
+from .logs import install_redaction, log_exc
 from .storage import Repo
 
 log = logging.getLogger("kotib")
 
 ALLOWED_UPDATES = ["message", "callback_query", "business_connection", "business_message",
                    "edited_business_message", "deleted_business_messages"]
+# Архив личных переписок: файлы только владельцу процесса (база, WAL, медиа, kb 0600, каталоги 0700).
+UMASK = 0o077
+# Остановка: апдейты в обработке ждём столько, потом отложенный ответ в работе. Вместе меньше
+# stop_grace_period в compose (30 с), иначе Docker убьёт процесс раньше.
+HANDLERS_SHUTDOWN = 10
+WORKER_SHUTDOWN = 15
 
 
 def default_properties() -> DefaultBotProperties:
@@ -64,13 +71,42 @@ def quiet_loggers() -> None:
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def private_files() -> int:
+    """Новые файлы и каталоги только для своего пользователя. Возвращает прежнюю маску."""
+    return os.umask(UMASK)
+
+
+async def drop_webhook(bot: Bot) -> None:
+    """Если на токене когда-то стоял webhook, getUpdates отвечает 409 и поллинг молча стоит.
+    Очередь не сбрасываем: правки и удаления за время простоя шпиону нужны."""
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except TelegramAPIError as e:
+        log.warning("deleteWebhook: %s", type(e).__name__)
+
+
+async def stop_worker(worker: asyncio.Task[None], stop: asyncio.Event, timeout: float) -> None:
+    """Мягко: новые ответы не берём, текущий даём закончить. Не успел: отмена, строка вернётся после рестарта."""
+    stop.set()
+    try:
+        await asyncio.wait_for(asyncio.shield(worker), timeout)
+    except TimeoutError:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+
+
 async def main() -> None:
+    private_files()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     quiet_loggers()
+    install_redaction()
     s = config.load()
     repo = await Repo.open(s.db_path)
-    bot = Bot(s.bot_token, default=default_properties())
+    bot = Bot(s.bot_token, session=tg.SafeSession(), default=default_properties())
     tg.setup_session(bot)
+    poll = tg.PollWatch()
+    bot.session.middleware(poll)
     llm = build_llm(s)
     stt = build_stt(s)
     app = App(s, repo, bot, llm=llm, stt=stt)
@@ -84,13 +120,14 @@ async def main() -> None:
     log.info("@%s запущен: владелец %s, ИИ %s/%s%s, STT %s", me.username, app.owner_id or "не задан",
              s.llm_provider, s.llm_model, "" if llm else " (нет ключа)", stt.model if stt else "нет")
     await scheduler.startup_notice(app)
-    worker = asyncio.create_task(scheduler.run(app), name="pending")
+    await drop_webhook(bot)
+    stop = asyncio.Event()
+    worker = asyncio.create_task(scheduler.run(app, stop=stop, ready=poll.caught_up), name="pending")
     try:
-        await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES, handle_signals=True)
+        await dp.start_polling(bot, allowed_updates=ALLOWED_UPDATES, handle_signals=True,
+                               close_bot_session=False, tasks_shutdown_timeout=HANDLERS_SHUTDOWN)
     finally:
-        worker.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker
+        await stop_worker(worker, stop, WORKER_SHUTDOWN)
         await repo.close()
         await bot.session.close()
 

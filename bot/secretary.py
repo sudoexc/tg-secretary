@@ -1,6 +1,7 @@
 """Секретарь: когда отвечать, отложенный ответ, решение модели, отправка, лиды и handoff владельцу."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -29,7 +30,9 @@ CLASSIFY_TOKENS = 1024
 FIRST_REPLY_GAP = timedelta(hours=12)
 VOICE_NOTICE_GAP = timedelta(hours=24)
 LIMIT_NOTICE_GAP = timedelta(hours=24)
+CLASSIFY_FAIL_GAP = timedelta(hours=6)
 DAY = timedelta(hours=24)
+VOICE_KINDS = ("voice", "video_note")
 MAX_IMAGES = 3
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 SERVICE_IDS = frozenset({777000})  # служебные уведомления Telegram
@@ -45,24 +48,53 @@ class Outcome:
 # --- кто чей ------------------------------------------------------------------
 
 
+def is_auto(m: StoredMessage) -> bool:
+    """Автоответ Telegram Business от имени владельца (приветствие, «нет на месте»): не его ответ."""
+    return bool(m.extra.get("offline"))
+
+
 def who_of(m: StoredMessage) -> str:
     if m.is_bot_sent:
         return "assistant"
-    return "owner" if m.is_owner else "client"
+    if m.is_owner:
+        return "auto" if is_auto(m) else "owner"
+    return "client"
 
 
 def to_lines(app: App, history: list[StoredMessage]) -> list[Line]:
     return [Line(who_of(m), m.date.astimezone(app.s.tz), spy.describe(m, for_ai=True)) for m in history]
 
 
+def answered_upto(history: list[StoredMessage]) -> int:
+    """До какого id сообщения собеседника уже отвечено. Ручной ответ владельца закрывает всё до себя,
+    наш ответ только свою пачку (extra.upto), автоответ Telegram ничего не закрывает."""
+    upto = 0
+    for m in history:
+        if not m.is_owner or is_auto(m):
+            continue
+        mark = m.extra.get("upto") if m.is_bot_sent else None
+        upto = max(upto, mark if isinstance(mark, int) else m.message_id)
+    return upto
+
+
 def client_batch(history: list[StoredMessage]) -> list[StoredMessage]:
-    """Сообщения собеседника после последней реплики с нашей стороны: на них и отвечаем одним ответом."""
-    batch: list[StoredMessage] = []
-    for m in reversed(history):
-        if m.is_owner:
-            break
-        batch.append(m)
-    return list(reversed(batch))
+    """Сообщения собеседника без ответа: на них и отвечаем одним ответом. Что клиент дописал, пока ИИ
+    думал над прошлой пачкой, остаётся здесь, хотя наш ответ в чате уже ниже."""
+    upto = answered_upto(history)
+    return [m for m in history if not m.is_owner and m.message_id > upto]
+
+
+def _meaningful(m: StoredMessage) -> bool:
+    """Есть ли по сообщению что классифицировать: текст, подпись, расшифровка, файл."""
+    if m.is_bot_sent or is_auto(m):
+        return False
+    if m.transcript:
+        return True
+    if m.kind == "sticker":
+        return False
+    if m.kind == "document":
+        return True
+    return bool((m.text or "").strip())
 
 
 # --- можно ли отвечать ---------------------------------------------------------
@@ -103,9 +135,13 @@ async def blocker(app: App, chat: Chat | None, conn: Connection | None, at: date
 
 
 async def on_owner_message(app: App, inc: spy.Incoming) -> None:
-    """Владелец ответил сам: отложенный ответ отменяется, секретарь молчит takeover часов."""
+    """Владелец ответил сам: отложенный ответ отменяется, секретарь молчит takeover часов.
+    Время берём из самого сообщения: после простоя бота апдейт приходит позже, чем владелец написал."""
     now = app.now()
-    await app.repo.update_chat(inc.chat_id, last_owner_msg_at=now)
+    at = min(inc.date, now)
+    chat = await app.repo.get_chat(inc.chat_id)
+    if chat is None or chat.last_owner_msg_at is None or chat.last_owner_msg_at < at:
+        await app.repo.update_chat(inc.chat_id, last_owner_msg_at=at)
     n = await app.repo.cancel_pending(inc.chat_id, now, "owner")
     if n:
         log.info("чат %s: владелец ответил, отложенный ответ отменён", inc.chat_id)
@@ -155,14 +191,22 @@ async def process_pending(app: App, p: Pending) -> str:
         if not await app.repo.claim_pending(p.id, app.now()):
             return "taken"
         status, reason = "error", "exception"
+        cancelled = False
         try:
             status, reason = await _process(app, p)
+        except asyncio.CancelledError:
+            # Остановка контейнера посреди ответа: строка остаётся running, и при старте requeue_running
+            # вернёт её в очередь. Если ответ уже ушёл, повтор увидит пустую пачку и ничего не пошлёт.
+            cancelled = True
+            log.info("чат %s: остановка посреди ответа, повторю после рестарта", p.chat_id)
+            raise
         except Exception as e:
             log_exc(log, "чат %s: ответ секретаря упал", e, p.chat_id)
             if app.raise_errors:
                 raise
         finally:
-            await app.repo.finish_pending(p.id, status, reason, app.now())
+            if not cancelled:
+                await app.repo.finish_pending(p.id, status, reason, app.now())
         log.info("чат %s: отложенный ответ %s (%s)", p.chat_id, status, reason)
         return status
 
@@ -189,20 +233,36 @@ async def _process(app: App, p: Pending) -> tuple[str, str]:
         await _limit_handoff(app, chat, limit)
         return "skipped", "limit"
 
+    # Сначала расшифровка: текст голосового нужен и классификации нового чата, и ответу.
+    if app.stt is not None:
+        for m in batch:
+            if m.kind in VOICE_KINDS and not m.transcript:
+                await transcribe(app, m)
+    unheard = await _unheard_voices(app, chat.chat_id, batch)
+
     if chat.ai_mode == "auto" and chat.chat_class == "unknown":
+        if not any(_meaningful(m) for m in history[-prompts.CLASSIFY_MESSAGES:]):
+            # Разбирать нечего (голосовое без расшифровки, стикер, фото без подписи): класс не фиксируем.
+            if unheard:
+                await _unknown_voice_notice(app, chat)
+                return "skipped", "voice_unknown"
+            return "skipped", "unclear"
         cls = await classify(app, chat, history)
         if cls is None:
+            await _classify_failed(app, chat)
             return "error", "classify_failed"
+        if cls == "unclear" and unheard:
+            await _unknown_voice_notice(app, chat)
+            return "skipped", "voice_unknown"
         if cls != "business":
             return "skipped", cls
         chat = await repo.get_chat(chat.chat_id) or chat
 
-    voices = [m for m in batch if m.kind in ("voice", "video_note") and not m.transcript]
-    if voices and app.stt is not None:
-        for m in voices:
-            await transcribe(app, m)
-    if any(m.kind in ("voice", "video_note") and not m.transcript for m in batch):
-        await _voice_handoff(app, chat, conn, history)
+    if unheard:
+        taken = await _taken_over(app, chat.chat_id, started, batch)
+        if taken:
+            return "cancelled", taken
+        await _voice_handoff(app, chat, conn, history, batch, unheard)
         return "done", "voice"
 
     first = await _first_reply(app, chat.chat_id, started)
@@ -214,25 +274,18 @@ async def _process(app: App, p: Pending) -> tuple[str, str]:
         await system_handoff(app, chat, "ИИ не смог ответить по схеме, клиенту ничего не ушло")
         await repo.update_chat(chat.chat_id, handoff_at=app.now())
         return "error", "llm_failed"
-    d = outcome.decision
+    d = prompts.finalize(outcome.decision)
     reply, handoff, why = d.reply, d.handoff, d.handoff_reason
-    if reply:
-        reply = prompts.undash(reply)
-    if reply and prompts.looks_secret(reply):
-        reply, handoff, why = None, True, "Ответ ИИ похож на реквизиты или ключ, не отправил"
 
     if reply:
         await show_typing(app, conn, chat.chat_id)
-    # Пока модель думала и «печатала», владелец мог ответить сам или выключить ИИ в чате.
-    fresh = await repo.get_chat(chat.chat_id)
-    if fresh and fresh.last_owner_msg_at and fresh.last_owner_msg_at >= started.replace(microsecond=0):
-        return "cancelled", "owner"
-    if fresh and fresh.ai_mode == "off":
-        return "cancelled", "chat_off"
+    taken = await _taken_over(app, chat.chat_id, started, batch)
+    if taken:
+        return "cancelled", taken
 
     sent: Message | None = None
     if reply:
-        sent = await send_reply(app, conn, chat.chat_id, reply, typing=False)
+        sent = await send_reply(app, conn, chat.chat_id, reply, typing=False, upto=batch[-1].message_id)
         if sent is None:
             await system_handoff(app, chat, "Не смог отправить ответ: чат неактивен больше 24 ч или нет прав")
             await repo.update_chat(chat.chat_id, handoff_at=app.now())
@@ -254,6 +307,35 @@ async def _process(app: App, p: Pending) -> tuple[str, str]:
     if sent:
         return "done", "replied"
     return "done", "handoff" if handoff else "silent"
+
+
+async def _taken_over(app: App, chat_id: int, started: datetime, batch: list[StoredMessage]) -> str | None:
+    """Пока шли расшифровка, модель и «печатает», владелец мог ответить сам или выключить ИИ в чате.
+    Ответ владельца ищем и по времени, и по порядку сообщений: после простоя дата и время обработки расходятся."""
+    fresh = await app.repo.get_chat(chat_id)
+    if fresh and fresh.last_owner_msg_at and fresh.last_owner_msg_at >= started.replace(microsecond=0):
+        return "owner"
+    if fresh and fresh.ai_mode == "off":
+        return "chat_off"
+    last = batch[-1].message_id
+    recent = await app.repo.recent_messages(chat_id, prompts.CONTEXT_MESSAGES)
+    if any(m.is_owner and not m.is_bot_sent and not is_auto(m) and m.message_id > last for m in recent):
+        return "owner"
+    return None
+
+
+async def _once_per(app: App, key: str, gap: timedelta) -> bool:
+    """True и отметка, если с прошлого раза по ключу прошло больше gap."""
+    raw = await app.repo.kv_get(key)
+    now = app.now()
+    if raw:
+        try:
+            if now - datetime.fromisoformat(raw) < gap:
+                return False
+        except ValueError:
+            pass
+    await app.repo.kv_set(key, now.isoformat())
+    return True
 
 
 async def _first_reply(app: App, chat_id: int, now: datetime) -> bool:
@@ -341,6 +423,10 @@ async def classify(app: App, chat: Chat, history: list[StoredMessage]) -> str | 
             log.warning("классификация %s, попытка %d: %s", chat.chat_id, attempt, e)
             continue
         cls = parsed.chat_class
+        if cls == "unclear":
+            # Запроса ещё нет (одно приветствие): класс не фиксируем, следующую пачку разберём заново.
+            log.info("чат %s: класс пока не ясен", chat.chat_id)
+            return cls
         await app.repo.update_chat(chat.chat_id, chat_class=cls, class_reason=fmt.trunc(parsed.reason, 300))
         log.info("чат %s: класс %s", chat.chat_id, cls)
         if cls == "business" and chat.new_client_card_at is None:
@@ -401,8 +487,9 @@ async def show_typing(app: App, conn: Connection, chat_id: int) -> None:
 
 
 async def send_reply(app: App, conn: Connection, chat_id: int, text: str, *, typing: bool = True,
-                     ) -> Message | None:
-    """От имени владельца через business_connection_id, обычным текстом без разметки."""
+                     upto: int | None = None) -> Message | None:
+    """От имени владельца через business_connection_id, обычным текстом без разметки.
+    upto: id последнего сообщения собеседника, на которое этот ответ отвечает (граница пачки)."""
     if typing:
         await show_typing(app, conn, chat_id)
     try:
@@ -413,7 +500,7 @@ async def send_reply(app: App, conn: Connection, chat_id: int, text: str, *, typ
         return None
     stored = StoredMessage(
         connection_id=conn.id, chat_id=chat_id, message_id=msg.message_id, from_id=app.owner_id, is_owner=True,
-        is_bot_sent=True, date=app.now(), kind="text", text=text)
+        is_bot_sent=True, date=app.now(), kind="text", text=text, extra={"upto": upto} if upto else {})
     await app.repo.save_message(stored)
     return msg
 
@@ -461,28 +548,38 @@ async def system_handoff(app: App, chat: Chat, reason: str) -> None:
 
 
 async def _limit_reason(app: App, chat_id: int, now: datetime) -> str | None:
-    since = now - DAY
-    if await app.repo.count_replies(since, chat_id) >= app.s.chat_daily_limit:
+    """Лимиты на ответы клиенту и отдельно на вызовы модели: решения без ответа тоже стоят денег."""
+    since, s, repo = now - DAY, app.s, app.repo
+    if await repo.count_replies(since, chat_id) >= s.chat_daily_limit:
         return "chat"
-    if await app.repo.count_replies(since) >= app.s.total_daily_limit:
+    if await repo.count_replies(since) >= s.total_daily_limit:
         return "all"
+    if await repo.count_calls(since, chat_id) >= s.chat_call_limit:
+        return "chat_calls"
+    if await repo.count_calls(since) >= s.total_call_limit:
+        return "all_calls"
     return None
 
 
 async def _limit_handoff(app: App, chat: Chat, which: str) -> None:
     """Лимит: клиенту ничего, владельцу одно уведомление на чат в сутки."""
-    key = f"limit_note:{chat.chat_id}"
-    last = await app.repo.kv_get(key)
-    now = app.now()
-    if last and now - datetime.fromisoformat(last) < LIMIT_NOTICE_GAP:
+    if not await _once_per(app, f"limit_note:{chat.chat_id}", LIMIT_NOTICE_GAP):
         return
-    await app.repo.kv_set(key, now.isoformat())
-    if which == "chat":
-        reason = f"Лимит ИИ: {app.s.chat_daily_limit} ответов в этом чате за сутки. Клиенту больше не отвечаю."
-    else:
-        reason = f"Лимит ИИ: {app.s.total_daily_limit} ответов за сутки на все чаты. Клиенту не ответил."
-    log.info("чат %s: лимит ответов (%s)", chat.chat_id, which)
+    s = app.s
+    reason = {
+        "chat": texts.LIMIT_CHAT.format(n=s.chat_daily_limit),
+        "all": texts.LIMIT_ALL.format(n=s.total_daily_limit),
+        "chat_calls": texts.LIMIT_CHAT_CALLS.format(n=s.chat_call_limit),
+        "all_calls": texts.LIMIT_ALL_CALLS.format(n=s.total_call_limit),
+    }[which]
+    log.info("чат %s: лимит ИИ (%s)", chat.chat_id, which)
     await system_handoff(app, chat, reason)
+
+
+async def _classify_failed(app: App, chat: Chat) -> None:
+    """ИИ не разобрал новый чат: владельцу сказать, но не чаще раза в 6 часов на чат. Класс остаётся unknown."""
+    if await _once_per(app, f"classify_fail:{chat.chat_id}", CLASSIFY_FAIL_GAP):
+        await system_handoff(app, chat, texts.CLASSIFY_FAILED)
 
 
 _UZ_LAT = re.compile(r"\b(salom|assalomu|rahmat|qancha|narx|kerak|qilib|bormi|yaxshi|iltimos|men|siz)\b|o'|g'|oʻ|gʻ",
@@ -505,17 +602,42 @@ def guess_language(texts_: list[str]) -> str:
 
 
 VOICE_UZ_CYR = "Овозли хабарни олдим, Жавоҳирга етказаман."
+VOICE_INTRO_UZ_CYR = ("Ассалому алайкум, мен Жавоҳирнинг ассистентиман, у ҳозир банд. "
+                      "Овозли хабарни олдим, унга етказаман.")
 
 
-async def _voice_handoff(app: App, chat: Chat, conn: Connection, history: list[StoredMessage]) -> None:
-    """Расшифровки нет: клиенту один раз «голосовое получил», владельцу уведомление."""
+def voice_text(lang: str, intro: bool) -> str:
+    if lang == "uz_cyr":
+        return VOICE_INTRO_UZ_CYR if intro else VOICE_UZ_CYR
+    table = texts.VOICE_INTRO if intro else texts.VOICE_RECEIVED
+    return table.get(lang, table["ru"])
+
+
+async def _unheard_voices(app: App, chat_id: int, batch: list[StoredMessage]) -> list[StoredMessage]:
+    """Голосовые пачки без расшифровки, о которых владельцу ещё не сообщали."""
+    raw = await app.repo.kv_get(f"voice_seen:{chat_id}")
+    seen = int(raw) if raw and raw.isdigit() else 0
+    return [m for m in batch if m.kind in VOICE_KINDS and not m.transcript and m.message_id > seen]
+
+
+async def _voice_handoff(app: App, chat: Chat, conn: Connection, history: list[StoredMessage],
+                         batch: list[StoredMessage], voices: list[StoredMessage]) -> None:
+    """Расшифровки нет: клиенту один раз «голосовое получил» (первым сообщением ещё и представиться),
+    владельцу уведомление. Эти голосовые больше не повод для handoff: следующий текст клиента ответит ИИ."""
     now = app.now()
+    await app.repo.kv_set(f"voice_seen:{chat.chat_id}", str(max(m.message_id for m in voices)))
     if chat.voice_notice_at is None or now - chat.voice_notice_at > VOICE_NOTICE_GAP:
         lang = guess_language([m.text for m in history if not m.is_owner and m.kind == "text" and m.text])
-        text = VOICE_UZ_CYR if lang == "uz_cyr" else texts.VOICE_RECEIVED.get(lang, texts.VOICE_RECEIVED["ru"])
-        if await send_reply(app, conn, chat.chat_id, text):
+        text = voice_text(lang, await _first_reply(app, chat.chat_id, now))
+        if await send_reply(app, conn, chat.chat_id, text, upto=batch[-1].message_id):
             await app.repo.update_chat(chat.chat_id, voice_notice_at=now)
     await system_handoff(app, chat, "Голосовое сообщение, расшифровки нет. Послушай сам.")
+
+
+async def _unknown_voice_notice(app: App, chat: Chat) -> None:
+    """Голосовое из неразобранного чата: клиенту ничего (вдруг это друг), владельцу вопрос с кнопками."""
+    if await _once_per(app, f"unknown_voice:{chat.chat_id}", VOICE_NOTICE_GAP):
+        await app.notify(texts.UNKNOWN_VOICE.format(who=fmt.link(chat, chat.chat_id)), kb.new_client(chat.chat_id))
 
 
 # --- песочница ----------------------------------------------------------------------
@@ -532,8 +654,11 @@ async def sandbox_turn(app: App, text: str) -> Outcome:
     ctx = Context(name="Тестовый клиент", username=None, chat_class="business",
                   now_local=now.astimezone(app.s.tz), lines=lines, first_reply=first)
     outcome = await decide(app, ctx, [], chat_id=None, kind="test")
-    if outcome.decision and outcome.decision.reply:
-        app.sandbox.append(Line("assistant", app.now().astimezone(app.s.tz), outcome.decision.reply))
+    if outcome.decision is not None:
+        # Показываем то, что ушло бы клиенту: та же постобработка, что в бою.
+        outcome.decision = prompts.finalize(outcome.decision)
+        if outcome.decision.reply:
+            app.sandbox.append(Line("assistant", app.now().astimezone(app.s.tz), outcome.decision.reply))
     return outcome
 
 

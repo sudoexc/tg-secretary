@@ -6,7 +6,7 @@ import re
 
 import pytest
 
-from bot import texts
+from bot import fmt, texts
 from bot.keyboards import ChatCb, LeadCb, MenuCb
 from bot.llm import LLMError
 from tests.conftest import World
@@ -203,3 +203,55 @@ async def test_user_facing_texts_have_no_dashes() -> None:
         if isinstance(val, dict):
             for v in val.values():
                 assert not DASHES.search(v), name
+
+
+async def test_leads_view_fits_telegram_limit(ready: World) -> None:
+    """30 открытых лидов с длинными полями: одно сообщение до 4096, «и ещё N», кнопки только у показанных."""
+    w = ready
+    now = w.app.now()
+    for i in range(30):
+        cid = 700000 + i
+        await w.app.repo.touch_chat(cid, f"Клиент номер {i} с длинным именем", f"client_{i}_name", now)
+        await w.app.repo.upsert_lead(cid, {"need": "сайт для сети кафе с доставкой " * 6, "deadline": "к концу месяца",
+                                           "budget": "около 500 долларов", "contact": "+998 90 123 45 67"}, now)
+    await w.dm("/leads")
+    view = w.session.of("sendMessage", chat_id=OWNER)[-1]
+    assert fmt.visible_len(view.text) <= fmt.MESSAGE_LIMIT
+    assert "Открытые лиды</b>: 30" in view.text
+    shown = len(re.findall(r"^\d+\. ", view.text, re.M))
+    assert 0 < shown < 30 and f"и ещё {30 - shown}" in view.text
+    closes = [b for b in view.buttons if b["text"].startswith("✅ Закрыт")]
+    assert len(closes) == shown
+    # Закрыли показанный: список перерисован, лидов меньше
+    await w.press(closes[0]["callback_data"], message_id=9)
+    assert await w.app.repo.count_open_leads() == 29
+    assert fmt.visible_len(w.session.of("editMessageText")[-1].text) <= fmt.MESSAGE_LIMIT
+
+
+async def test_sandbox_long_reply_fits_limit(ready: World) -> None:
+    w = ready
+    reply = ("Пакет включает сайт, бот, CRM и поддержку. " * 40)[:1490]
+    w.llm.reply({"reply": reply, "handoff": False, "handoff_reason": None,
+                 "lead": {"name": "Тест", "need": "подробно про все услуги " * 40, "budget": None, "deadline": None,
+                          "contact": None, "notes": "заметка " * 120},
+                 "lead_ready": False, "language": "ru"})
+    await w.dm("/test")
+    await w.dm("Расскажи подробно про все услуги")
+    out = w.session.of("sendMessage", chat_id=OWNER)[-1].text
+    assert fmt.visible_len(out) <= fmt.MESSAGE_LIMIT
+    assert reply[:200] in out
+
+
+async def test_sandbox_shows_what_client_would_get(ready: World) -> None:
+    """Песочница показывает итог после той же постобработки, что в бою: без тире, реквизиты не уходят."""
+    w = ready
+    base = {"handoff": False, "handoff_reason": None, "lead": None, "lead_ready": False, "language": "ru"}
+    w.llm.reply({"reply": "Лендинг — от 300$", **base}, {"reply": "Переведите на карту 8600 1234 5678 9012", **base})
+    await w.dm("/test")
+    await w.dm("Сколько стоит?")
+    out = w.session.of("sendMessage", chat_id=OWNER)[-1].text
+    assert "Лендинг, от 300$" in out and not DASHES.search(out)
+    await w.dm("Куда платить?")
+    out = w.session.of("sendMessage", chat_id=OWNER)[-1].text
+    assert "8600" not in out and texts.SANDBOX_NO_REPLY in out and "реквизиты" in out
+    assert [ln.text for ln in w.app.sandbox or [] if ln.who == "assistant"] == ["Лендинг, от 300$"]
